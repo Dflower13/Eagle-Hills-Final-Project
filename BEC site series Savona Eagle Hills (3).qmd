@@ -1,0 +1,244 @@
+---
+title: "BEC site series near Savona (Eagle Hills)"
+author: "Danielle Lafleur, Cristhina Florez, Catalina Valle, Andrea Patino"
+format: html
+editor: visual
+---
+
+Packages
+
+```{r}
+remotes::install_github("mlr-org/mlr3spatial@prob")
+library(tidyverse)
+library(mlr3)
+library(sf)
+library(terra)
+library(lidR)
+library(Rsagacmd)
+library(mapview)
+library(units)
+library(bcmaps)
+library(mlr3verse)
+library(mlr3spatial)
+library(mlr3spatiotempcv)
+library(future)
+library(remotes)
+```
+
+Download provided LAS data and relevant GeoPackage layers.
+
+```{r}
+
+las_ctg <- readLAScatalog("Eagle Hills_IDFdk1.las", filter = "-keep_random_fraction 0.5")
+las_ctg
+plot(las_ctg, mapview = TRUE)
+
+site_ctg <- st_as_sf(las_ctg, coords = c("Long", "Lat"), crs = 3005)
+site_ctg
+
+bec_ctg <- bec(ask = interactive(), force = FALSE) %>% 
+  st_intersection(site_ctg)
+
+availableCores()
+plan(multisession)
+
+opt_output_files(las_ctg) <- "01_retile/{XLEFT}_{YBOTTOM}"
+
+opt_chunk_size(las_ctg) <- 500
+opt_chunk_buffer(las_ctg) <- 0
+
+opt_chunk_alignment(las_ctg) <- c(500, 500)
+plot(las_ctg, chunk_pattern = TRUE)
+
+ctg_tiled <- catalog_retile(las_ctg)
+
+View(ctg_tiled)
+plot(ctg_tiled, mapview = TRUE)
+
+opt_filter(ctg_tiled) <- ""
+
+opt_chunk_size(ctg_tiled) <- 0
+opt_chunk_buffer(ctg_tiled) <- 15
+
+opt_output_files(ctg_tiled) <- "02_ground/{*}"
+
+ctg_ground <- classify_ground(ctg_tiled, algorithm = csf(sloop_smooth = TRUE))
+
+View(ctg_ground)
+plot(ctg_ground, mapview = TRUE)
+
+opt_output_files(ctg_ground) <- ""
+dem <- rasterize_terrain(ctg_ground, res = 5, algorithm = tin())
+
+dir.create("ta", showWarnings = FALSE)
+dem <- writeRaster(dem, "ta/dem.tif", overwrite = TRUE)
+
+plot(dem)
+plot_dtm3d(dem)
+```
+
+SAGA GIS
+
+```{r}
+saga_path <- "C:/Users/TRU/Documents/SAGA/saga-9.3.2_x64/saga_cmd.exe"
+saga <- saga_gis(saga_path, raster_format = "GeoTIFF")
+dem = rast("ta/dem.tif")
+
+dem_preproc <- saga$ta_preprocessor$sink_removal(
+  dem = dem, dem_preproc = "ta/dem_preproc.tif")
+sources(dem_preproc)
+
+## slope
+
+saga$ta_morphometry$slope_aspect_curvature
+
+View(tidy(saga$ta_morphometry$slope_aspect_curvature))
+
+slope_aspect <- saga$ta_morphometry$slope_aspect_curvature(
+  elevation = dem_preproc, slope = "ta/slope.tif", aspect = "ta/aspect.tif", 
+  method = 6, unit_slope = "radians", unit_aspect = "radians",
+  .all_outputs = FALSE)
+
+## MRVBF
+
+mrvbf_thresh <- mrvbf_threshold(res = res(dem)[1])
+mrvbf <- saga$ta_morphometry$multiresolution_index_of_valley_bottom_flatness_mrvbf(
+  dem = dem_preproc, mrvbf = "ta/mrvbf.tif", mrrtf = "ta/mrrtf.tif", 
+  t_slope = mrvbf_thresh)
+
+## TRI
+
+tri <- saga$ta_morphometry$terrain_ruggedness_index_tri(
+  dem = dem_preproc, tri = "ta/tri.tif")
+
+## TWI
+
+tca <- saga$ta_hydrology$flow_accumulation_top_down(
+  elevation = dem_preproc, flow = "ta/tca_TEMP.tif", .all_outputs = FALSE)
+
+sca <- saga$ta_hydrology$flow_width_and_specific_catchment_area(
+  dem = dem_preproc, tca = tca, sca = "ta/sca_TEMP.tif", .all_outputs = FALSE)
+
+twi <- saga$ta_hydrology$topographic_wetness_index(
+  slope = slope_aspect$slope, area = sca, twi = "ta/twi.tif")
+
+## overland flow distance to channel network
+
+so <- saga$ta_channels$strahler_order(
+  dem = dem_preproc, strahler = "ta/strahler_TEMP.tif", .all_outputs = FALSE)
+
+cn <- saga$ta_channels$channel_network(
+  elevation = dem_preproc, init_grid = so, init_value = 5,
+  chnlntwrk = "ta/cn_TEMP.tif", .all_outputs = FALSE)
+
+overland_flow <- saga$ta_channels$overland_flow_distance_to_channel_network(
+  elevation = dem_preproc, channels = cn, distance = "ta/o_flow.tif", 
+  disthorz = "ta/h_flow.tif", distvert = "ta/v_flow.tif", boundary = FALSE, 
+  .all_outputs = FALSE)
+
+## negative openness and positive openness
+
+openness <- saga$ta_lighting$topographic_openness(
+  dem = dem_preproc, pos = "ta/openness_pos.tif", neg = "ta/openness_neg.tif")
+
+## Terrain layers
+
+model_layers <- c(
+  slope_aspect$slope, slope_aspect$aspect, mrvbf$mrvbf, mrvbf$mrrtf, tri, twi, 
+  overland_flow$distance, openness$pos, openness$neg)
+plot(model_layers)
+```
+
+Extract the raster data where the polygons are located:
+
+```{r}
+poly <- st_read("Field data.gpkg") %>%
+  mutate(ID = row_number()) %>% 
+  st_transform(st_crs(bec_ctg)) %>%
+  select(X2MapUnit1) %>%
+  rename(site_series = X2MapUnit1) %>%
+  mutate(ID = row_number(), site_series = factor(site_series))
+
+# poly_crs <- st_as_sf(poly) %>% 
+#   st_transform(st_crs(bec_ctg))
+# poly_crs
+
+# poly_bec <- st_intersection(bec_ctg, poly) %>% 
+#   group_by(MAP_LABEL)
+
+vectors <- vect(poly)
+
+extraction <- extract(model_layers, vectors, ID = TRUE, xy = TRUE) %>% 
+  st_as_sf(coords = c("x", "y"), crs = st_crs(vectors))
+
+extraction_join <- left_join(extraction, st_drop_geometry(poly), by = "ID") %>%
+  select(-ID)
+```
+
+Classification task
+
+```{r}
+
+# vector_extraction <- vect(extraction_join)
+
+tsk_eagle <- as_task_classif_st(extraction_join, target = "site_series")
+tsk_eagle
+```
+
+Classification learners
+
+```{r}
+lrn_eagle <- lrn("classif.ranger", num.trees = 500, mtry = 2)
+lrn_eagle
+
+lrn_eagle_tune <- lrn("classif.ranger", 
+                   num.trees = to_tune(100, 2000), predict_type = "prob",
+                   mtry = to_tune(1, length(tsk_eagle$feature_types)),
+                   importance = "impurity")
+lrn_eagle_tune
+```
+
+Tuner design
+
+```{r}
+df_design <- expand.grid(
+  num.trees = c(100, 250, 500, 750, 1000, 1500, 2000),
+  mtry = 1:length(tsk_eagle$feature_types))
+
+dt_design <- data.table(df_design)
+
+tnr_design <- tnr("design_points", design = dt_design)
+```
+
+Cross validation
+
+```{r}
+cv_inner <- rsmp("cv", folds = 10)
+cv_outer <- rsmp("spcv_coords", folds = 4)
+```
+
+Autotuner
+
+```{r}
+at <- auto_tuner(
+  tuner = tnr_design,
+  learner = lrn_eagle_tune,
+  resampling = cv_inner,
+  measure = msr("classif.ce"),
+  terminator = trm("none")
+)
+```
+
+Run models in parallel
+
+```{r}
+outer_cores <- min(4, availableCores())
+inner_cores <- floor(availableCores() / outer_cores)
+ 
+plan(list(
+   tweak("multisession", workers = outer_cores),
+   tweak("multisession", workers = inner_cores)
+ ))
+
+rr <- resample(tsk_eagle, at, cv_outer, store_models = TRUE)
+```
